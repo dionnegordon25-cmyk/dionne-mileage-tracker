@@ -104,7 +104,7 @@ textarea{resize:vertical;min-height:180px}
   <div id="page-input" class="page">
     <div class="card card-pad">
       <div style="font-size:13px;font-weight:600;margin-bottom:4px">Upload diary images</div>
-      <div style="font-size:11px;color:#777;margin-bottom:12px">Upload JPEG or PNG photos of your diary, calendar screenshots or printouts. Claude reads the text automatically.</div>
+      <div style="font-size:11px;color:#777;margin-bottom:12px">Upload JPEG or PNG photos of your diary, calendar screenshots or printouts. The app reads the dates, times and addresses automatically.</div>
       <div class="upload-zone" id="upload-zone"
         onclick="document.getElementById('file-input').click()"
         ondragover="event.preventDefault();this.classList.add('drag')"
@@ -424,49 +424,37 @@ function renderPreviews(){
   if(btns) btns.style.display=pendingImgs.length?"flex":"none";
 }
 
+// Shrink each photo before sending (keeps it quick and under the upload limit)
+function shrinkImg(url){ return new Promise(res=>{ const im=new Image(); im.onload=()=>{ const max=1800, sc=Math.min(1,max/Math.max(im.width,im.height)); const c=document.createElement("canvas"); c.width=Math.round(im.width*sc); c.height=Math.round(im.height*sc); c.getContext("2d").drawImage(im,0,0,c.width,c.height); res(c.toDataURL("image/jpeg",0.85)); }; im.onerror=()=>res(url); im.src=url; }); }
 async function readImages(){
   if(!pendingImgs.length) return;
-  document.getElementById("img-status").innerHTML='<div class="alert alert-warn">Reading photos isn\'t switched on for this app yet. Please paste the diary text below instead (from Outlook, a spreadsheet or a PDF).</div>';
-  return;
   const btn=document.getElementById("btn-read");
   const status=document.getElementById("img-status");
   btn.disabled=true; btn.innerHTML='<span class="spinner"></span>Reading images...';
-  status.innerHTML='';
-  let combined="";
+  let combined="", failed=[];
   for(let i=0;i<pendingImgs.length;i++){
     status.innerHTML=`<div class="alert alert-info"><span class="spinner"></span>Reading image ${i+1} of ${pendingImgs.length}…</div>`;
-    const img=pendingImgs[i];
-    const b64=img.url.split(",")[1];
-    const mt=img.file.type||"image/jpeg";
     try{
-      const res=await fetch("https://api.anthropic.com/v1/messages",{
-        method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({
-          model:"claude-sonnet-4-6",
-          max_tokens:2000,
-          messages:[{role:"user",content:[
-            {type:"image",source:{type:"base64",media_type:mt,data:b64}},
-            {type:"text",text:"This is a diary or calendar page belonging to a lettings manager in SE London. Please extract ALL appointments and entries exactly as written. Include date headers, times and locations/addresses. Output plain text only, one entry per line, keeping date headers. Do not summarise — transcribe exactly what you see including all addresses and postcodes."}
-          ]}]
-        })
-      });
-      const data=await res.json();
-      if(data.error){ status.innerHTML=`<div class="alert alert-warn">API error: ${data.error.message}</div>`; break; }
-      combined+="\n"+(data.content&&data.content[0]&&data.content[0].text||"");
-    }catch(err){
-      status.innerHTML=`<div class="alert alert-warn">Failed to read image ${i+1}: ${err.message}</div>`;
-      break;
-    }
+      const small=await shrinkImg(pendingImgs[i].url);
+      const res=await fetch("/.netlify/functions/mileage-read",{method:"POST",headers:{"Content-Type":"application/json","x-mileage-pin":getPin()},
+        body:JSON.stringify({type:"image/jpeg",data:small.split(",")[1]})});
+      const data=await res.json().catch(()=>({}));
+      if(res.status===401){ try{ localStorage.removeItem("mileage_pin"); }catch(e){} throw new Error("Wrong PIN – reload and try again"); }
+      if(!res.ok) throw new Error(data.error||("Error "+res.status));
+      combined+="\n"+(data.text||"");
+    }catch(err){ failed.push("image "+(i+1)+": "+err.message); }
   }
   btn.disabled=false; btn.innerHTML="Read images & extract journeys";
-  if(!combined.trim()){ status.innerHTML='<div class="alert alert-warn">Could not extract text from the images.</div>'; return; }
+  if(!combined.trim()){ status.innerHTML='<div class="alert alert-warn">Could not read the images. '+failed.join("; ")+'</div>'; return; }
+  // show what was read so it can be checked / corrected before adding
+  document.getElementById("paste-area").value=combined.trim();
   const entries=parseDiary(combined);
-  if(!entries.length){ status.innerHTML='<div class="alert alert-warn">No travel appointments found in these images. Try pasting text instead.</div>'; return; }
+  if(!entries.length){ status.innerHTML='<div class="alert alert-warn">Read the images but found no appointments with addresses. The text is in the box below – check it, then click "Parse & add to log".'+(failed.length?' ('+failed.join("; ")+')':'')+'</div>'; return; }
   const journeys=buildJourneys(entries);
   const rows=toRows(journeys);
   merge(rows);
-  status.innerHTML=`<div class="alert alert-ok">✓ Read ${entries.length} appointments → ${rows.length} journeys added to your log.</div>`;
+  status.innerHTML=`<div class="alert alert-ok">✓ Read ${entries.length} appointments → ${rows.length} journeys added to your log.${failed.length?' Not read: '+failed.join("; "):''}</div>`;
+  document.getElementById("paste-area").value="";
   clearImages();
   switchTab("log",document.querySelectorAll(".tab")[0]);
 }
