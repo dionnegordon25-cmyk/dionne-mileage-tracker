@@ -72,6 +72,7 @@ textarea{resize:vertical;min-height:180px}
     <button class="btn btn-primary" onclick="exportCSV()">Export CSV</button>
     <button class="btn btn-primary" onclick="exportPDF()" style="background:#2A5F3A">Export PDF</button>
     <button class="btn" onclick="addManualRow()">+ Add row</button>
+    <button class="btn" id="btn-recheck" onclick="recheckPostcodes()">Recheck postcodes</button>
   </div>
 </div>
 
@@ -207,7 +208,7 @@ function load(){
     .then(data=>{
       logs=[];
       if(data&&typeof data==="object"&&!Array.isArray(data)){
-        Object.keys(data).forEach(k=>{ const row=data[k]; if(row&&row.ds){ row.fbKey=k; logs.push(row); } });
+        Object.keys(data).forEach(k=>{ const row=data[k]; if(k.indexOf("_pc_")===0){ if(row&&row.pc&&row.lat!=null) PCX[row.pc]=[row.lat,row.lng]; return; } if(row&&row.ds){ row.fbKey=k; logs.push(row); } });
         logs.sort((a,b)=>(a.ds||"").localeCompare(b.ds||""));
       }
       if(logs.length){ const ms=[...new Set(logs.map(l=>l.ds.slice(0,7)))].sort(); activeMonth=ms[ms.length-1]; }
@@ -227,6 +228,35 @@ function save(){
 function deleteFromFB(key){ fb("mileage/"+key,{method:"DELETE"}).catch(e=>console.error(e)); }
 
 // ═══════════════════════════════════════════════════════════════════
+// POSTCODE LOOKUP (postcodes.io – free UK postcode service). Found postcodes are
+// remembered in the database (mileage/_pc_XXXX) so they are never flagged again.
+// ═══════════════════════════════════════════════════════════════════
+const PCX = {};
+function pcNorm(p){ return String(p||"").toUpperCase().replace(/\s/g,""); }
+function pcAll(texts){
+  const out=new Set();
+  (texts||[]).forEach(t=>{ const re=/\b([A-Z]{1,2}\d{1,2}[A-Z]?\s?\d[A-Z]{2}|[A-Z]{1,2}\d{1,2}[A-Z]?)\b/gi; let m; while((m=re.exec(String(t||"")))) out.add(pcNorm(m[1])); });
+  return [...out];
+}
+function pcRemember(pc,lat,lng){ PCX[pc]=[lat,lng]; fb("mileage/_pc_"+pc,{method:"PUT",body:JSON.stringify({pc,lat,lng})}).catch(()=>{}); }
+async function pcPrefetch(texts){
+  const all=pcAll(texts), full=all.filter(p=>p.length>4&&/\d[A-Z]{2}$/.test(p)&&!PCX[p]), out=all.filter(p=>!/\d[A-Z]{2}$/.test(p)||p.length<=4).filter(p=>!PC[p]&&!PCX[p]);
+  const bad=[];
+  if(full.length){
+    try{
+      const r=await fetch("https://api.postcodes.io/postcodes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({postcodes:full.slice(0,100)})});
+      const d=await r.json();
+      (d.result||[]).forEach(x=>{ const pc=pcNorm(x.query); if(x.result&&x.result.latitude!=null) pcRemember(pc,x.result.latitude,x.result.longitude); else bad.push(pc); });
+    }catch(e){ console.warn("postcode lookup failed",e); }
+  }
+  for(const oc of out){
+    try{ const r=await fetch("https://api.postcodes.io/outcodes/"+encodeURIComponent(oc)); const d=await r.json();
+      if(d.result&&d.result.latitude!=null) pcRemember(oc,d.result.latitude,d.result.longitude); else bad.push(oc); }catch(e){}
+  }
+  return bad;
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // DISTANCE
 // ═══════════════════════════════════════════════════════════════════
 function hav([a,b],[c,d]){
@@ -242,8 +272,10 @@ function getPC(t){
 function coords(pc){
   if(!pc) return null;
   pc=pc.toUpperCase().replace(/\s/g,"");
+  if(PCX[pc]) return PCX[pc];
   const ow=pc.length>3?pc.slice(0,pc.length-3):pc;
   if(PC[ow]) return PC[ow];
+  if(PCX[ow]) return PCX[ow];
   if(PC[pc.slice(0,3).replace(/\d$/,"")]) return PC[pc.slice(0,3).replace(/\d$/,"")];
   if(PC[pc.slice(0,2).replace(/\d$/,"")]) return PC[pc.slice(0,2).replace(/\d$/,"")];
   return null;
@@ -449,6 +481,7 @@ async function readImages(){
   // show what was read so it can be checked / corrected before adding
   document.getElementById("paste-area").value=combined.trim();
   const entries=parseDiary(combined);
+  if(entries.length){ status.innerHTML='<div class="alert alert-info"><span class="spinner"></span>Looking up postcodes…</div>'; await pcPrefetch(entries.map(e=>e.addr)); }
   if(!entries.length){ status.innerHTML='<div class="alert alert-warn">Read the images but found no appointments with addresses. The text is in the box below – check it, then click "Parse & add to log".'+(failed.length?' ('+failed.join("; ")+')':'')+'</div>'; return; }
   const journeys=buildJourneys(entries);
   const rows=toRows(journeys);
@@ -462,12 +495,14 @@ async function readImages(){
 // ═══════════════════════════════════════════════════════════════════
 // TEXT PARSE
 // ═══════════════════════════════════════════════════════════════════
-function parseText(){
+async function parseText(){
   const text=document.getElementById("paste-area").value.trim();
   const status=document.getElementById("text-status");
   if(!text){ status.innerHTML='<div class="alert alert-warn">Please paste some diary text first.</div>'; return; }
   const entries=parseDiary(text);
   if(!entries.length){ status.innerHTML='<div class="alert alert-warn">No travel appointments found. Make sure dates and addresses are included.</div>'; return; }
+  status.innerHTML='<div class="alert alert-info"><span class="spinner"></span>Looking up postcodes…</div>';
+  await pcPrefetch(entries.map(e=>e.addr));
   const journeys=buildJourneys(entries);
   const rows=toRows(journeys);
   merge(rows);
@@ -493,10 +528,33 @@ function deleteRow(i){
   if(fbKey) deleteFromFB(fbKey);
   save();
 }
+function routeStops(route){ return String(route||"").split(/\s*→\s*/).map(x=>x.trim()).filter(x=>x&&!/^office$/i.test(x)); }
+async function recalcRow(i,quiet){
+  const row=logs[i]; if(!row) return;
+  const bad=await pcPrefetch(routeStops(row.route));
+  const before=row.miles, r=calcJourney(routeStops(row.route));
+  row.miles=r.miles; row.claim=Math.round(r.miles*HMRC*100)/100; row.unk=r.unk; row.bad=bad; row.milesManual=false; row.edited=true;
+  row.recalcNote=before!==r.miles?"recalculated "+Number(before||0).toFixed(1)+" → "+r.miles.toFixed(1)+" mi":"";
+  if(row.fbKey) fb("mileage/"+row.fbKey,{method:"PUT",body:JSON.stringify(row)}).catch(e=>console.error(e));
+  if(!quiet) render();
+}
+// Only rows still showing "postcode not found" – rows that are already fine (past claims) are left exactly as they are
+async function recheckPostcodes(){
+  const idx=logs.map((r,i)=>r.unk&&r.unk.length&&!r.milesManual?i:-1).filter(i=>i>-1);
+  if(!idx.length){ alert("No rows with missing postcodes."); return; }
+  const btn=document.getElementById("btn-recheck"); if(btn){ btn.disabled=true; btn.textContent="Checking…"; }
+  for(const i of idx) await recalcRow(i,true);
+  if(btn){ btn.disabled=false; btn.textContent="Recheck postcodes"; }
+  render();
+  const left=logs.filter(r=>r.unk&&r.unk.length).length;
+  alert("Checked "+idx.length+" row(s)."+(left?" "+left+" still need the address or postcode correcting – click Edit on them.":" All postcodes found."));
+}
 function saveField(i,field,val){
   if(!logs[i]) return;
+  const old=logs[i][field];
   logs[i]={...logs[i],[field]:val,edited:true};
-  if(field==="miles"){ const m=parseFloat(val)||0; logs[i].miles=m; logs[i].claim=Math.round(m*HMRC*100)/100; }
+  if(field==="miles"){ const m=parseFloat(val)||0; logs[i].miles=m; logs[i].claim=Math.round(m*HMRC*100)/100; logs[i].milesManual=true; logs[i].recalcNote=""; }
+  if(field==="route"&&val!==old&&!logs[i].milesManual){ recalcRow(i); return; }
   const row=logs[i];
   if(row.fbKey){
     fb("mileage/"+row.fbKey,{method:"PUT",body:JSON.stringify(row)}).catch(e=>console.error(e));
@@ -555,7 +613,9 @@ function render(){
       <td>
         ${ed?`<input type="text" value="${row.route.replace(/"/g,"&quot;")}" onblur="saveField(${i},'route',this.value)" style="font-size:11px">`
           :`<div class="route-text">${row.route}</div>`}
-        ${row.unk&&row.unk.length?`<div class="unknown-warn">⚠ Postcode not found: ${row.unk.join(", ")}</div>`:""}
+        ${row.bad&&row.bad.length?`<div class="unknown-warn" style="color:#c00">⚠ Postcode not recognised – check it: ${row.bad.join(", ")}</div>`:row.unk&&row.unk.length?`<div class="unknown-warn">⚠ Postcode not found: ${row.unk.join(", ")} – click Edit and correct the address</div>`:""}
+        ${row.recalcNote?`<div style="font-size:10px;color:#2E7D32;margin-top:3px">✓ ${row.recalcNote}</div>`:""}
+        ${row.milesManual?`<div style="font-size:10px;color:#888;margin-top:3px">miles typed in by you</div>`:""}
       </td>
       <td style="text-align:right;white-space:nowrap">
         ${ed?`<input type="number" step="0.1" value="${row.miles}" onblur="saveField(${i},'miles',this.value)" style="width:70px;text-align:right">`
@@ -565,6 +625,7 @@ function render(){
       <td><input type="text" value="${(row.notes||"").replace(/"/g,"&quot;")}" placeholder="notes" onblur="saveField(${i},'notes',this.value)" style="font-size:11px"></td>
       <td style="white-space:nowrap">
         <button class="btn btn-sm" onclick="toggleEdit(${i})" style="margin-right:4px">${ed?"Done":"Edit"}</button>
+        ${ed||row.milesManual?`<button class="btn btn-sm" title="Work the miles out again from the route" onclick="recalcRow(${i})" style="margin-right:4px">↻</button>`:""}
         <button class="btn btn-sm btn-danger" onclick="deleteRow(${i})">✕</button>
       </td>
     </tr>`;
