@@ -1,5 +1,17 @@
 // Dionne's Mileage Tracker – reads a diary photo/screenshot with Claude and returns the appointments as a table.
 // Netlify environment variables: ANTHROPIC_API_KEY, MILEAGE_PIN (optional: MILEAGE_MODEL)
+
+// Works on every Netlify Node version (no reliance on built-in fetch)
+const https = require('https');
+function req(url, opts, body) {
+  return new Promise((resolve, reject) => {
+    const r = https.request(url, { method: opts.method || 'GET', headers: opts.headers || {} }, res => {
+      let d = ''; res.setEncoding('utf8'); res.on('data', c => d += c); res.on('end', () => resolve({ status: res.statusCode, text: d }));
+    });
+    r.on('error', reject); r.setTimeout(25000, () => r.destroy(new Error('timed out')));
+    if (body) r.write(body); r.end();
+  });
+}
 exports.handler = async function (event) {
   const json = (code, obj) => ({ statusCode: code, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }, body: JSON.stringify(obj) });
   if (event.httpMethod !== 'POST') return json(405, { error: 'POST only' });
@@ -16,14 +28,12 @@ exports.handler = async function (event) {
     + 'Property = the full address including postcode exactly as written (leave blank if no address). Type = viewing, valuation, inspection, maintenance, check-in, check-out, meeting, call etc. '
     + 'Include calls, meetings and personal items too (with a blank Property) – do not invent addresses. One row per appointment.';
   try {
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
+    const r0 = await req('https://api.anthropic.com/v1/messages', {
       method: 'POST',
-      headers: { 'x-api-key': KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-      body: JSON.stringify({ model: process.env.MILEAGE_MODEL || 'claude-haiku-4-5-20251001', max_tokens: 2500,
-        messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: b.type, data: b.data } }, { type: 'text', text: prompt }] }] })
-    });
-    const d = await r.json();
-    if (!r.ok) return json(502, { error: (d.error && d.error.message) || ('AI error ' + r.status) });
+      headers: { 'x-api-key': String(KEY).trim(), 'anthropic-version': '2023-06-01', 'content-type': 'application/json' } }, JSON.stringify({ model: process.env.MILEAGE_MODEL || 'claude-haiku-4-5-20251001', max_tokens: 2500,
+        messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: b.type, data: b.data } }, { type: 'text', text: prompt }] }] }));
+    let d = {}; try { d = JSON.parse(r0.text || '{}'); } catch (e) {}
+    if (r0.status < 200 || r0.status >= 300) return json(502, { error: (d.error && d.error.message) || ('AI error ' + r0.status) });
     return json(200, { text: ((d.content || [])[0] || {}).text || '' });
-  } catch (e) { return json(502, { error: 'Could not reach the AI service – please try again' }); }
+  } catch (e) { return json(502, { error: 'Could not reach the AI service: ' + e.message }); }
 };
