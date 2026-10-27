@@ -197,7 +197,7 @@ function fb(path,opts){
   opts=opts||{};
   return fetch("/.netlify/functions/mileage-db?path="+encodeURIComponent(path),{method:opts.method||"GET",headers:{"Content-Type":"application/json","x-mileage-pin":getPin()},body:opts.body})
     .then(r=>{ if(r.status===401){ try{ localStorage.removeItem("mileage_pin"); }catch(e){} alert("Wrong PIN – please reload the page and try again."); throw new Error("Wrong PIN"); }
-      if(!r.ok) throw new Error("Database error "+r.status); return r.text().then(t=>t?JSON.parse(t):null); });
+      if(!r.ok) return r.text().then(t=>{ let m=""; try{ m=JSON.parse(t).error||""; }catch(e){} throw new Error("Database error "+r.status+(m?" – "+m:"")); }); return r.text().then(t=>t?JSON.parse(t):null); });
 }
 
 function load(){
